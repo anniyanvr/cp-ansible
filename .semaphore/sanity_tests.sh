@@ -1,0 +1,97 @@
+# Runs sanity and galaxy-importer checks on collection to ensure all the checks are met
+
+set -ex
+
+echo "Sanity + Galaxy-Importer Test Block"
+echo "----------------"
+echo "Python $PYTHON_VERSION"
+echo "Ansible $ANSIBLE_VERSION"
+
+
+cd $PATH_TO_CPA
+
+version_gte() {
+    # returns 0 if first arg version is greater than equal to second arg else returns 1
+
+    local actual_ansi_version="$1"
+    local min_allowed_ansi_version="$2"
+
+    # Sort the versions in ascending order
+    sorted_versions=$(printf "%s\n%s" "$actual_ansi_version" "$min_allowed_ansi_version" | sort -V)
+
+    versions=($sorted_versions)
+    # Split the sorted versions into an array
+
+    if [[ "${versions[0]}" = "$min_allowed_ansi_version" ]]; then
+        echo 0
+        # actual ansible core version >= min allowed
+    else
+        echo 1
+        # min core version allowed > actual ansible version
+    fi
+}
+
+# This is very bad practice of grepping from yml files. Whenever someone will change the yml file significantly then this might break
+MIN_ALLOWED_CORE_VERSION_LINE=$(cat meta/runtime.yml | grep 'requires_ansible:')
+MIN_ALLOWED_CORE_VERSION=${MIN_ALLOWED_CORE_VERSION_LINE:21:4}
+ANSI_CORE_VERSION_OKAY=$(version_gte $ANSIBLE_CORE_VERSION $MIN_ALLOWED_CORE_VERSION)
+if [[ $ANSI_CORE_VERSION_OKAY -eq 1 ]]; then
+    echo "Skipping this block as meta/runtime.yml specified minimum version is newer than this" >> $LOG_FILE
+    exit
+fi
+
+sudo apt install -y shellcheck
+
+# prepend the desired default python version to .python-version file
+{ echo "$PYTHON_VERSION"; cat .python-version 2>/dev/null || true; } > .python-version.tmp && mv .python-version.tmp .python-version
+
+# Explicitly activate the desired Python version using Semaphore's sem-version
+sem-version python $PYTHON_VERSION
+
+# mise only keeps one global Python version active by default, which breaks ansible-test
+# sanity's multi-interpreter compile checks (they shim into python3.10/3.11/etc directly).
+mise use --global python@3.10 python@3.11 python@3.12 python@3.13
+
+pip install wheel
+pip install pylint
+pip install "ansible==$ANSIBLE_VERSION"
+pip install yamllint
+pip install galaxy-importer
+pip install setuptools
+
+python --version
+ansible --version
+
+export PYTHON_INTERPRETER=$(which python)
+echo $PYTHON_INTERPRETER
+
+# Test1
+export GALAXY_IMPORTER_CONFIG="$PATH_TO_CPA/galaxy-importer/galaxy-importer.cfg"
+python -m galaxy_importer.main $ARTEFACT
+
+# Test2
+ansible-test sanity
+
+# Test3 - Custom set_fact Secret Leak Check
+echo "Running custom set_fact secret leak sanity check..."
+python3 $PATH_TO_CPA/.semaphore/setfact_secret_check.py
+
+echo "set_fact secret leak sanity check completed."
+
+# Test4 - Custom URI Authorization Check
+echo "Running custom URI authorization sanity check..."
+python3 $PATH_TO_CPA/.semaphore/uri_auth_check.py
+
+echo "URI authorization secret leak sanity check completed."
+
+# Test5 - Rootless privileged-tag Check
+echo "Running rootless privileged-tag sanity check..."
+python$PYTHON_VERSION $PATH_TO_CPA/.semaphore/rootless_privileged_tag_check.py
+
+echo "Rootless privileged-tag sanity check completed."
+
+# Test6 - Rootless unguarded-become Check
+echo "Running rootless unguarded-become sanity check..."
+python$PYTHON_VERSION $PATH_TO_CPA/.semaphore/rootless_become_check.py
+
+echo "Rootless unguarded-become sanity check completed."

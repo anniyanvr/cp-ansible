@@ -1,0 +1,79 @@
+---
+- name: Kafka Connect Status Finding
+  hosts: kafka_connect
+  gather_facts: false
+  tags: kafka_connect
+  environment: "{{ proxy_env }}"
+  tasks:
+    - import_role:
+        name: variables
+
+    - name: Populate service facts
+      service_facts:
+      when: not (rootless_lifecycle_enabled | bool)
+
+    - name: Query rootless service state (systemd --user, read-only)
+      include_role:
+        name: common
+        tasks_from: rootless_service_state.yml
+      vars:
+        rootless_component_name: kafka_connect
+      when: rootless_lifecycle_enabled | bool
+
+    - name: Determine Installation Pattern - Parallel or Serial
+      set_fact:
+        install_pattern: "{{ 'parallel' if service_state != 'running' or kafka_connect_deployment_strategy == 'parallel' else 'serial' }}"
+      vars:
+        service_state: >-
+          {{ rootless_service_state | default('unknown')
+             if rootless_lifecycle_enabled | bool
+             else (ansible_facts.services[kafka_connect_service_name + '.service'].state | default('unknown')) }}
+
+    - name: Group Hosts by Installation Pattern
+      group_by:
+        key: kafka_connect_{{install_pattern}}
+      changed_when: false
+
+- name: Kafka Connect Parallel Provisioning
+  hosts: kafka_connect_parallel
+  gather_facts: false
+  tags: kafka_connect
+  environment: "{{ proxy_env }}"
+  tasks:
+    - import_role:
+        name: kafka_connect
+
+- name: Kafka Connect Serial Provisioning
+  hosts: kafka_connect_serial
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+  tags: kafka_connect
+  environment: "{{ proxy_env }}"
+  tasks:
+    - import_role:
+        name: kafka_connect
+
+    - name: Proceed Prompt
+      pause:
+        prompt: "Press Enter to Proceed to Next Node. Ctrl + C to Abort"
+      when: kafka_connect_pause_rolling_deployment|bool
+
+- name: Cleanup Temporary SSL Files
+  hosts: kafka_connect
+  gather_facts: false
+  tags: kafka_connect
+  environment: "{{ proxy_env }}"
+  tasks:
+    - import_role:
+        name: variables
+
+    - name: Delete temporary keys/certs when keystore and trustore is provided
+      file:
+        path: "{{item}}"
+        state: absent
+      loop:
+        - "{{kafka_connect_ca_cert_path}}"
+        - "{{kafka_connect_cert_path}}"
+        - "{{kafka_connect_key_path}}"
+      when: (ssl_provided_keystore_and_truststore | bool)

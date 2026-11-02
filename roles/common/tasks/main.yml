@@ -1,0 +1,285 @@
+---
+- name: Confirm Hash Merging Enabled
+  assert:
+    that: lookup('config', 'DEFAULT_HASH_BEHAVIOUR') == 'merge'
+    fail_msg: "Hash Merging must be enabled in ansible.cfg"
+  tags:
+    - validate
+    - validate_hash_merge
+
+- name: Verify Ansible version
+  assert:
+    that:
+      - "ansible_version.full is version('2.16', '>=')"
+    fail_msg: >-
+      "You must update Ansible to at least 2.16 to use these playbooks."
+  tags:
+    - validate
+    - validate_ansi_version
+
+- name: Gather OS Facts
+  setup:
+    gather_subset:
+      - '!all'
+      - '!any'
+      - user
+      - os_family
+      - hardware
+  tags: always
+
+- name: Verify Python version
+  assert:
+    that:
+      - "ansible_python_version is version('3.10', '>=')"
+    fail_msg: >-
+      Selected python version: {{ansible_python_version}}, You must upgrade Python to at least 3.10 to use these playbooks
+  tags:
+    - validate
+    - validate_python_version
+    - notest
+
+- name: Verify rootless prerequisites
+  assert:
+    that:
+      - installation_method == "archive"
+      - rootless_deployment_path | length > 0
+      - deployment_user | length > 0
+      - deployment_group | length > 0
+    fail_msg: >-
+      rootless_enabled requires installation_method: archive, rootless_deployment_path,
+      deployment_user, and deployment_group all set (the package method needs root;
+      artifacts must live under a user-writable path; deployment_group must be set
+      explicitly because rootless_bootstrap's own fallback for it - deployment_user -
+      diverges from the main deploy's fallback of 'confluent', which doesn't exist as
+      an OS group on a rootless host).
+  when: rootless_enabled | bool
+  tags:
+    - validate
+    - notest
+
+- name: Rootless (non-root) prerequisite bootstrap
+  include_tasks: rootless_prereqs.yml
+  when: rootless_enabled | bool
+
+# Catches two real footguns early with a clear message, instead of a confusing permission-denied
+# failure deep in the deploy: rootless_deployment_path itself not actually writable (e.g. rootless_bootstrap
+# was never run), and an old inventory's explicit override of a rootless_deployment_path-derived variable
+# (e.g. ssl_file_dir) pointing at a root-owned path that survived turning rootless_enabled on.
+# ssl_file_dir may not exist yet on a cold deploy (the ssl role creates it later) - ensure it
+# exists first so the write-test below isn't a false positive on a merely-missing directory.
+- name: "Ensure {{ item }} exists (rootless writability check)"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  register: rootless_writability_mkdir
+  loop:
+    - "{{ rootless_deployment_path_final }}"
+    - "{{ ssl_file_dir_final }}"
+  loop_control:
+    label: "{{ item }}"
+  ignore_errors: true
+  changed_when: false
+  when: rootless_enabled | bool
+
+- name: "Check {{ item }} is writable (rootless)"
+  ansible.builtin.file:
+    path: "{{ item }}/.rootless_writability_check"
+    state: touch
+    mode: '0644'
+  register: rootless_writability_check
+  loop:
+    - "{{ rootless_deployment_path_final }}"
+    - "{{ ssl_file_dir_final }}"
+  loop_control:
+    label: "{{ item }}"
+  ignore_errors: true
+  changed_when: false
+  when: rootless_enabled | bool
+
+- name: Remove rootless writability check files
+  ansible.builtin.file:
+    path: "{{ item.item }}/.rootless_writability_check"
+    state: absent
+  loop: "{{ rootless_writability_check.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - rootless_enabled | bool
+    - not (item.failed | default(false))
+  changed_when: false
+
+- name: Assert rootless_deployment_path and ssl_file_dir are writable (rootless)
+  assert:
+    that: not (item.failed | default(false))
+    fail_msg: >-
+      '{{ item.item }}' is not writable by the connecting user. Under rootless_enabled, every
+      rootless_deployment_path-derived path (including ssl_file_dir) must be writable by deployment_user -
+      run confluent.platform.rootless_bootstrap first, or if you've explicitly overridden this
+      variable from an old inventory, point it under rootless_deployment_path instead.
+  loop: "{{ rootless_writability_check.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: rootless_enabled | bool
+
+- name: Check for non-interactive sudo escalation (rootless)
+  ansible.builtin.command: sudo -n true
+  register: rootless_sudo_probe
+  failed_when: false
+  changed_when: false
+  when: rootless_enabled | bool
+  tags:
+    - validate
+    - notest
+
+# Passwordless sudo doesn't break a rootless deploy (it's never invoked), but its presence means
+# this host isn't actually privilege-isolated from root, contradicting the point of rootless_enabled -
+# warn rather than fail, since removing/restricting it is outside cp-ansible's control.
+- name: Warn if deploy user has non-interactive sudo (rootless)
+  ansible.builtin.debug:
+    msg: >-
+      '{{ ansible_user }}' has passwordless sudo access to root on this host. rootless_enabled
+      never uses it, but its availability means this deployment is not actually privilege-isolated -
+      restrict or remove it if that guarantee matters here.
+  when:
+    - rootless_enabled | bool
+    - rootless_sudo_probe.rc == 0
+  tags:
+    - validate
+    - notest
+
+- name: Red Hat Repo Setup and Java Installation
+  include_tasks: redhat.yml
+  when: ansible_os_family == "RedHat"
+
+- name: Ubuntu Repo Setup and Java Installation
+  include_tasks: ubuntu.yml
+  when: ansible_distribution == "Ubuntu"
+
+- name: Debian Repo Setup and Java Installation
+  include_tasks: debian.yml
+  when: ansible_distribution == "Debian"
+
+- name: Config Validations
+  include_tasks: config_validations.yml
+  when: validate_hosts|bool
+  tags:
+    - validate
+
+# Process Archive File deployments
+- name: Create Confluent Platform install directory
+  file:
+    path: "{{archive_destination_path}}"
+    group: "{{ omit if archive_group == '' else archive_group }}"
+    owner: "{{ omit if archive_owner == '' else archive_owner }}"
+    state: directory
+    mode: '755'
+  when: installation_method == "archive"
+
+# If the target directory (i.e. creates) doesn't exist then download and expand the remote archive into target
+- name: Expand remote Confluent Platform archive
+  unarchive:
+    src: "{{ confluent_archive_file_source }}"
+    remote_src: "{{ confluent_archive_file_remote }}"
+    dest: "{{archive_destination_path}}"
+    group: "{{ omit if archive_group == '' else archive_group }}"
+    owner: "{{ omit if archive_owner == '' else archive_owner }}"
+    mode: '755'
+    creates: "{{binary_base_path}}"
+  when: installation_method == "archive"
+
+- name: Set Group and Owner for Confluent Platform archive
+  file:
+    path: "{{binary_base_path}}"
+    group: "{{ omit if archive_group == '' else archive_group }}"
+    owner: "{{ omit if archive_owner == '' else archive_owner }}"
+    mode: '755'
+    recurse: true
+  when: installation_method == "archive"
+
+- name: Expand USM Agent archive
+  unarchive:
+    src: "{{ confluent_archive_usm_agent_file_source }}"
+    remote_src: "{{ confluent_archive_usm_agent_file_remote }}"
+    dest: "{{archive_destination_path}}"
+    group: "{{ omit if archive_group == '' else archive_group }}"
+    owner: "{{ omit if archive_owner == '' else archive_owner }}"
+    mode: '755'
+    creates: "{{usm_agent_binary_base_path}}"
+  when:
+    - "'usm_agent' in groups"
+    - inventory_hostname in groups.usm_agent
+    - installation_method == "archive"
+
+- name: Create Jolokia directory
+  file:
+    path: "{{ jolokia_jar_path | dirname }}"
+    state: directory
+    mode: '755'
+  when:
+    - lookup('vars', item + '_jolokia_enabled', default=jolokia_enabled)|bool
+  loop: "{{ group_names }}"
+
+- name: Copy Jolokia Jar
+  copy:
+    src: "{{ jolokia_jar_url }}"
+    dest: "{{ jolokia_jar_path }}"
+    mode: '755'
+  when:
+    - lookup('vars', item + '_jolokia_enabled', default=jolokia_enabled)|bool
+    - not jolokia_url_remote|bool
+  loop: "{{ group_names }}"
+
+- name: Download Jolokia Jar
+  get_url:
+    url: "{{ jolokia_jar_url }}"
+    dest: "{{ jolokia_jar_path }}"
+    force: "{{ jolokia_jar_url_force }}"
+    mode: '755'
+  register: jolokia_download_result
+  until: jolokia_download_result is success
+  retries: 5
+  delay: 5
+  when:
+    - lookup('vars', item + '_jolokia_enabled', default=jolokia_enabled)|bool
+    - jolokia_url_remote|bool
+    - not ansible_check_mode # (Bug ansible/ansible#65687)
+  loop: "{{ group_names }}"
+
+- name: Create Prometheus install directory
+  file:
+    path: "{{ jmxexporter_jar_path | dirname }}"
+    state: directory
+    mode: '755'
+  when: jmxexporter_enabled|bool
+
+- name: Copy Prometheus Jar
+  copy:
+    src: "{{ jmxexporter_jar_url }}"
+    dest: "{{ jmxexporter_jar_path }}"
+    mode: '755'
+  when:
+    - jmxexporter_enabled|bool
+    - not jmxexporter_url_remote|bool
+
+- name: Download Prometheus JMX Exporter Jar
+  get_url:
+    url: "{{ jmxexporter_jar_url }}"
+    dest: "{{ jmxexporter_jar_path }}"
+    force: "{{ jmxexporter_jar_url_force }}"
+    mode: '755'
+  register: prometheus_download_result
+  until: prometheus_download_result is success
+  retries: 5
+  delay: 5
+  when:
+    - jmxexporter_enabled|bool
+    - jmxexporter_url_remote|bool
+    - not ansible_check_mode # (Bug ansible/ansible#65687)
+
+- name: Install Confluent CLI
+  include_tasks: confluent_cli.yml
+  when: confluent_cli_download_enabled|bool
+
+- set_fact:
+    common_role_completed: true

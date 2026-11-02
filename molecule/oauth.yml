@@ -1,0 +1,16 @@
+---
+- name: Provision Oauth Server and Create Users
+  hosts: oauth_server
+  # gather_facts: false
+  tags: oauth
+  tasks:
+    - name: Refresh inventory
+      ansible.builtin.meta: refresh_inventory
+    - name: Startup Delay
+      wait_for:
+        timeout: 30
+    - name: Import OAuth role
+      import_role:
+        name: confluent.test.oauth
+      vars:
+        client_oauth_assertion_enabled: "{{ client_assertion_enabled | default(false) }}"

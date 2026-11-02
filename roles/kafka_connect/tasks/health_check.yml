@@ -1,0 +1,124 @@
+---
+- name: Get Authorization Token for Connect User
+  import_role:
+    name: common
+    tasks_from: get_authorization_token.yml
+  vars:
+    oauth: "{{ kafka_connect_oauth_enabled }}"
+    oauth_user: "{{ kafka_connect_oauth_user }}"
+    oauth_password: "{{ kafka_connect_oauth_password }}"
+    ldap_user: "{{ kafka_connect_ldap_user }}"
+    ldap_password: "{{ kafka_connect_ldap_password }}"
+    mtls_client_cert: "{{ kafka_connect_cert_path }}"
+    mtls_client_key: "{{ kafka_connect_key_path }}"
+    cert_auth_only_enabled: "{{ kafka_connect_mds_cert_auth_only|bool }}"
+    oauth_client_assertion_enabled: "{{ kafka_connect_oauth_client_assertion_enabled }}"
+    oauth_client_assertion_issuer: "{{ kafka_connect_oauth_client_assertion_issuer }}"
+    oauth_client_assertion_sub: "{{ kafka_connect_oauth_client_assertion_sub }}"
+    oauth_client_assertion_audience: "{{ kafka_connect_oauth_client_assertion_audience }}"
+    oauth_client_assertion_private_key_file: "{{ kafka_connect_oauth_client_assertion_private_key_file_dest_path }}"
+    oauth_client_assertion_private_key_passphrase: "{{ kafka_connect_oauth_client_assertion_private_key_passphrase }}"
+    oauth_client_assertion_file: "{{ kafka_connect_third_party_oauth_client_assertion_config.kafka_connect }}"
+    oauth_client_assertion_template_file: "{{ kafka_connect_oauth_client_assertion_template_file_dest_path }}"
+  when: rbac_enabled or kafka_connect_oauth_enabled
+
+# Cannot use Block/Rescue in Ansible Handlers: https://github.com/ansible/ansible/issues/14270
+# Implementing try/catch logic with ignore_errors and conditionals
+- name: Wait for API to return 200
+  uri:
+    url: "{{kafka_connect_http_protocol}}://{{ hostvars[inventory_hostname]|confluent.platform.resolve_and_format_hostname }}:{{kafka_connect_rest_port}}/connectors"
+    status_code: 200
+    validate_certs: false
+    # Basic auth header is redundant for non rbac install
+    url_username: "{{kafka_connect_health_check_user}}"
+    url_password: "{{kafka_connect_health_check_password}}"
+    force_basic_auth: true
+  register: result1
+  until: result1.status == 200
+  retries: "{{ kafka_connect_health_check_retries }}"
+  delay: "{{ kafka_connect_health_check_retry_delay }}"
+  when:
+    - kafka_connect_authentication_type != 'mtls'
+    - not ( rbac_enabled or kafka_connect_oauth_enabled)
+  ignore_errors: true
+
+- name: Wait for API to return 200
+  uri:
+    url: "{{kafka_connect_http_protocol}}://{{ hostvars[inventory_hostname]|confluent.platform.resolve_and_format_hostname }}:{{kafka_connect_rest_port}}/connectors"
+    status_code: 200
+    validate_certs: false
+    headers:
+      Authorization: "Bearer {{ authorization_token }}"
+  register: result1_oauth
+  until: result1_oauth.status == 200
+  retries: "{{ kafka_connect_health_check_retries }}"
+  delay: "{{ kafka_connect_health_check_retry_delay }}"
+  no_log: "{{mask_secrets|bool}}"
+  when:
+    - kafka_connect_authentication_type != 'mtls'
+    - rbac_enabled or kafka_connect_oauth_enabled
+  ignore_errors: true
+
+- set_fact:
+    certs_chain: "{{ssl_file_dir_final}}/{{ kafka_connect_service_name if kafka_connect_service_name != kafka_connect_default_service_name else 'kafka_connect' }}.chain"
+
+- name: Wait for API to return 200 - mTLS
+  uri:
+    url: "{{kafka_connect_http_protocol}}://{{ hostvars[inventory_hostname]|confluent.platform.resolve_and_format_hostname }}:{{kafka_connect_rest_port}}/connectors"
+    status_code: 200
+    validate_certs: false
+    client_cert: "{{ kafka_connect_cert_path if ssl_provided_keystore_and_truststore else certs_chain }}"
+    client_key: "{{kafka_connect_key_path}}"
+    # Basic auth header is redundant for non rbac install
+    url_username: "{{kafka_connect_health_check_user}}"
+    url_password: "{{kafka_connect_health_check_password}}"
+    force_basic_auth: true
+  register: result2
+  until: result2.status == 200
+  retries: "{{ kafka_connect_health_check_retries }}"
+  delay: "{{ kafka_connect_health_check_retry_delay }}"
+  when:
+    - kafka_connect_authentication_type == 'mtls'
+    - not (rbac_enabled or kafka_connect_oauth_enabled)
+  ignore_errors: true
+
+- name: Wait for API to return 200 - mTLS
+  uri:
+    url: "{{kafka_connect_http_protocol}}://{{ hostvars[inventory_hostname]|confluent.platform.resolve_and_format_hostname }}:{{kafka_connect_rest_port}}/connectors"
+    status_code: 200
+    validate_certs: false
+    client_cert: "{{ kafka_connect_cert_path if ssl_provided_keystore_and_truststore else certs_chain }}"
+    client_key: "{{kafka_connect_key_path}}"
+    headers:
+      Authorization: "Bearer {{ authorization_token }}"
+  register: result2_oauth
+  until: result2_oauth.status == 200
+  retries: "{{ kafka_connect_health_check_retries }}"
+  delay: "{{ kafka_connect_health_check_retry_delay }}"
+  no_log: "{{mask_secrets|bool}}"
+  when:
+    - kafka_connect_authentication_type == 'mtls'
+    - rbac_enabled or kafka_connect_oauth_enabled
+  ignore_errors: true
+
+- name: Fetch Log Files and Error out
+  block:
+    - name: Fetch Files for Debugging Failure
+      # Cannot use include_role in Ansible Handlers: https://github.com/ansible/ansible/issues/20493
+      include_tasks: ../../common/tasks/fetch_logs.yml
+      vars:
+        service_name: "{{kafka_connect_service_name}}"
+        config_file: "{{kafka_connect.config_file}}"
+        log_dir: "{{kafka_connect_service_environment_overrides.LOG_DIR}}"
+        user: "{{kafka_connect_user}}"
+        group: "{{kafka_connect_group}}"
+
+    - name: Fail Provisioning
+      fail:
+        msg: Health checks failed. Review exported files.
+  # When only one health check runs, only one will have a 'failed' field. For skipped checks, defaulting 'failed' to False
+  when:  >
+    result1.failed|default(False) or
+    result1_oauth.failed|default(False) or
+    result2.failed|default(False) or
+    result2_oauth.failed|default(False)

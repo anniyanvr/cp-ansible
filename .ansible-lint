@@ -1,0 +1,20 @@
+---
+exclude_paths:
+  - hosts_example.yml
+  - nuke.yml
+  - molecule/
+  - test_roles/
+  - .semaphore/
+  - service.yml
+  - docs/
+skip_list:
+  - var-spacing
+  - role-name
+  - empty-string-compare
+  - fqcn-builtins
+  - name
+  - var-naming[no-role-prefix]
+  - key-order
+  - fqcn[action]
+  - package-latest
+  - risky-shell-pipe

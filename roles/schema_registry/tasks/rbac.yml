@@ -1,0 +1,182 @@
+---
+- name: Decide Where to delegate task of getting superuser token
+  set_fact:
+    delegation_target: >-
+      {%- if external_mds_enabled | bool and (mds_ssl_client_authentication != 'none' or oauth_superuser_client_assertion_enabled | bool) -%}
+        localhost
+      {%- elif oauth_superuser_client_assertion_enabled | bool or mds_ssl_client_authentication != 'none' -%}
+        {{ groups['kafka_broker'][0] }}
+      {%- else -%}
+        {{ inventory_hostname }}
+      {%- endif -%}
+
+- name: RBAC Setup Tasks
+  import_role:
+    name: common
+    tasks_from: rbac_setup.yml
+  vars:
+    user: "{{schema_registry_user}}"
+    group: "{{schema_registry_group}}"
+    delegated_to_localhost: "{{ external_mds_enabled|bool }}"
+    erp_client_cert_path: "{{ schema_registry_cert_path }}"
+    erp_client_key_path: "{{ schema_registry_key_path }}"
+    cert_auth_only_enabled_for_rbac: "{{ schema_registry_mds_cert_auth_only|bool }}"
+  delegate_to: "{{ delegation_target }}"
+  # For single cluster delegating this task to broker as in case of cert based token retrival only broker can get a super user token using its certs
+  # For Centralized MDS other clusters can't delegate to MDS cluster as that cluster may not have permissions to ssh into MDS, thus delegate to localhost
+
+- set_fact:
+    send_client_cert: "{{ mds_ssl_client_authentication in ['required', 'requested'] }}"
+
+- name: Grant role System Admin to Additional Schema Registry users/groups
+  uri:
+    url: "{{mds_bootstrap_server_urls.split(',')[0]}}/security/1.0/principals/{% if 'User' not in item and 'Group' not in item %}User:{% endif %}{{item}}/roles/SystemAdmin"
+    method: POST
+    validate_certs: false
+    headers:
+      Content-Type: application/json
+      Authorization: "Bearer {{ authorization_token }}"
+    client_cert: "{{ schema_registry_cert_path if send_client_cert|bool else omit }}"
+    client_key: "{{ schema_registry_key_path if send_client_cert|bool else omit }}"
+    body_format: json
+    body: >
+      {
+        "clusters": {
+          "kafka-cluster": "{{kafka_cluster_id}}",
+          "schema-registry-cluster": "{{schema_registry_final_properties['schema.registry.group.id']}}"
+        }
+      }
+    status_code: 204
+  register: sr_mds_result
+  until: sr_mds_result.status == 204
+  retries: "{{ mds_retries }}"
+  delay: 5
+  no_log: "{{mask_secrets|bool}}"
+  loop: "{{schema_registry_additional_system_admins}}"
+  when: not ansible_check_mode
+
+- name: Grant Schema Registry user the role SecurityAdmin on the Schema Registry cluster
+  uri:
+    url: "{{mds_bootstrap_server_urls.split(',')[0]}}/security/1.0/principals/User:{{sr_user}}/roles/SecurityAdmin"
+    method: POST
+    validate_certs: false
+    headers:
+      Content-Type: application/json
+      Authorization: "Bearer {{ authorization_token }}"
+    client_cert: "{{ schema_registry_cert_path if send_client_cert|bool else omit }}"
+    client_key: "{{ schema_registry_key_path if send_client_cert|bool else omit }}"
+    body_format: json
+    body: >
+      {
+        "clusters": {
+          "kafka-cluster": "{{kafka_cluster_id}}",
+          "schema-registry-cluster": "{{schema_registry_final_properties['schema.registry.group.id']}}"
+        }
+      }
+    status_code: 204
+  register: sr_mds_result
+  until: sr_mds_result.status == 204
+  retries: "{{ mds_retries }}"
+  delay: 5
+  no_log: "{{mask_secrets|bool}}"
+  when: not ansible_check_mode
+
+- name: Grant Schema Registry user ClusterAdmin role for exporter endpoint access
+  uri:
+    url: "{{mds_bootstrap_server_urls.split(',')[0]}}/security/1.0/principals/User:{{sr_user}}/roles/ClusterAdmin"
+    method: POST
+    validate_certs: false
+    headers:
+      Content-Type: application/json
+      Authorization: "Bearer {{ authorization_token }}"
+    client_cert: "{{ schema_registry_cert_path if send_client_cert|bool else omit }}"
+    client_key: "{{ schema_registry_key_path if send_client_cert|bool else omit }}"
+    body_format: json
+    body: >
+      {
+        "clusters": {
+          "kafka-cluster": "{{kafka_cluster_id}}",
+          "schema-registry-cluster": "{{schema_registry_final_properties['schema.registry.group.id']}}"
+        }
+      }
+    status_code: 204
+  register: sr_cluster_admin_result
+  until: sr_cluster_admin_result.status == 204
+  retries: "{{ mds_retries }}"
+  delay: 5
+  no_log: "{{mask_secrets|bool}}"
+  when: not ansible_check_mode
+
+- name: Grant Schema Registry user ResourceOwner Schema Registry Group and Topic
+  uri:
+    url: "{{mds_bootstrap_server_urls.split(',')[0]}}/security/1.0/principals/User:{{sr_user}}/roles/ResourceOwner/bindings"
+    method: POST
+    validate_certs: false
+    headers:
+      Content-Type: application/json
+      Authorization: "Bearer {{ authorization_token }}"
+    client_cert: "{{ schema_registry_cert_path if send_client_cert|bool else omit }}"
+    client_key: "{{ schema_registry_key_path if send_client_cert|bool else omit }}"
+    body_format: json
+    body: >
+      {
+        "scope": {
+          "clusters": {
+            "kafka-cluster": "{{kafka_cluster_id}}"
+          }
+        },
+        "resourcePatterns": [
+          {
+            "resourceType":"Group",
+            "name": "{{schema_registry_final_properties['schema.registry.group.id']}}",
+            "patternType":"LITERAL"
+          },
+          {
+            "resourceType":"Topic",
+            "name": "{{schema_registry_final_properties['kafkastore.topic']}}",
+            "patternType":"LITERAL"
+          },
+          {
+            "resourceType":"Topic",
+            "name": "{{schema_registry_final_properties['confluent.license.topic']}}",
+            "patternType":"LITERAL"
+          },
+          {
+            "resourceType":"Topic",
+            "name": "_exporter_configs",
+            "patternType":"LITERAL"
+          },
+          {
+            "resourceType":"Topic",
+            "name": "_exporter_states",
+            "patternType":"LITERAL"
+          },
+          {
+            "resourceType":"Topic",
+            "name": "_importer_configs",
+            "patternType":"LITERAL"
+          },
+          {
+            "resourceType":"Topic",
+            "name": "_importer_states",
+            "patternType":"LITERAL"
+          },
+          {
+            "resourceType":"Topic",
+            "name": "_dek_registry_keys",
+            "patternType":"LITERAL"
+          },
+          {
+            "resourceType":"Topic",
+            "name": "_dek_registry_keks",
+            "patternType":"LITERAL"
+          }
+        ]
+      }
+    status_code: 204
+  register: sr_mds_result
+  until: sr_mds_result.status == 204
+  retries: "{{ mds_retries }}"
+  delay: 5
+  no_log: "{{mask_secrets|bool}}"
+  when: not ansible_check_mode

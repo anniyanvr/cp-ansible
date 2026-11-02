@@ -1,0 +1,34 @@
+---
+### deployment_user (cp-user) doesn't exist yet when the IPv6-preference play (implicit
+### gather_facts, connects as ansible_user unconditionally) or certificates.yml/ldap.yml/
+### oauth.yml connect here, so they all need to run as root. ldap_server/oauth_server are
+### excluded - they already opt out of rootless in molecule.yml.
+
+- name: Cache ansible_user=root so early prepare plays connect as root before the deploy user exists
+  hosts: kafka_controller:kafka_broker:schema_registry:kafka_connect:kafka_rest:ksql:control_center_next_gen
+  gather_facts: false
+  vars:
+    ansible_user: root
+  tasks:
+    - set_fact:
+        ansible_user: root
+
+- name: Configure IPv6 Preference
+  import_playbook: ../configure_ipv6.yml
+
+- name: Create Custom Certs
+  import_playbook: ../certificates.yml
+
+- name: Provision LDAP Server
+  import_playbook: ../ldap.yml
+
+- name: Provision Oauth Server
+  import_playbook: ../oauth.yml
+
+- name: Download OAuth IDP cert
+  hosts: localhost
+  tasks:
+    - shell: openssl s_client -showcerts -connect localhost:8443 </dev/null 2>/dev/null|openssl x509 -outform PEM > oauthcertfile.pem
+
+# External Prometheus: distribute the mock Prometheus CA to the hosts that connect to it.
+- import_playbook: ../external_prometheus_distribute_ca.yml

@@ -1,0 +1,216 @@
+---
+- name: Install apt-transport-https
+  apt:
+    name: apt-transport-https
+    update_cache: true
+  register: install_apt_transport_result
+  until: install_apt_transport_result is success  or ansible_check_mode
+  retries: 5
+  delay: 90
+  when: not (rootless_enabled | bool)
+  tags: package
+
+- name: Install gnupg for gpg-keys
+  apt:
+    name: gnupg2
+  register: install_gnupg_result
+  until: install_gnupg_result is success  or ansible_check_mode
+  retries: 5
+  delay: 90
+  when: not (rootless_enabled | bool)
+  tags: package
+
+- name: Install python3-debian for deb822_repository module
+  apt:
+    name: python3-debian
+  register: install_python_debian_result
+  until: install_python_debian_result is success or ansible_check_mode
+  retries: 5
+  delay: 90
+  tags: package
+  when:
+    - repository_configuration == 'confluent'
+    - installation_method == "package"
+
+- name: Add Confluent Repositories using deb822_repository
+  deb822_repository:
+    name: "{{ item.name }}"
+    types:
+      - deb
+    uris:
+      - "{{ item.uri }}"
+    suites:
+      - "{{ item.suite }}"
+    components:
+      - main
+    signed_by: "{{ item.signed_by }}"
+    state: present
+  loop:
+    - name: confluent-clients
+      uri: "{{ confluent_clients_repository_baseurl }}/clients/deb"
+      suite: "{{ ansible_distribution_release }}"
+      signed_by: "{{ confluent_common_repository_debian_clients_key_url }}"
+    - name: confluent-common
+      uri: "{{ confluent_common_repository_baseurl }}/deb/{{ confluent_repo_version }}"
+      suite: stable
+      signed_by: "{{ confluent_common_repository_debian_key_url }}"
+    - name: confluent-control-center-next-gen
+      uri: "{{ confluent_control_center_next_gen_repository_debian_baseurl }}"
+      suite: stable
+      signed_by: "{{ confluent_control_center_next_gen_repository_debian_key_url }}"
+    - name: confluent-usm-agent
+      uri: "{{ confluent_usm_agent_repository_debian_baseurl }}"
+      suite: stable
+      signed_by: "{{ confluent_usm_agent_repository_debian_key_url }}"
+  when:
+    - repository_configuration == 'confluent'
+    - installation_method == "package"
+  tags: package
+  notify:
+    - apt-get update
+
+
+- name: Ensure custom Confluent Apt Repo file does not exist when using Confluent repositories
+  file:
+    state: absent
+    path: /etc/apt/sources.list.d/custom_confluent.list
+  when:
+    - repository_configuration == 'confluent'
+    - installation_method == "package"
+
+- name: Ensure Confluent deb822 repositories are not present when repository_configuration is custom
+  deb822_repository:
+    name: "{{ item }}"
+    state: absent
+  loop:
+    - confluent-clients
+    - confluent-common
+    - confluent-control-center-next-gen
+    - confluent-usm-agent
+  when:
+    - repository_configuration == 'custom'
+    - installation_method == "package"
+
+- name: Add Custom Apt Repo
+  copy:
+    src: "{{custom_apt_repo_filepath}}"
+    dest: /etc/apt/sources.list.d/custom_confluent.list
+    mode: '644'
+  register: apt_custom_add_result
+  until: apt_custom_add_result is success
+  retries: 5
+  delay: 90
+  when: repository_configuration == 'custom'
+  notify:
+    - apt-get update
+
+- meta: flush_handlers
+
+- name: Make Sure man pages Directory Exists
+  file:
+    path: /usr/share/man/man1
+    state: directory
+    mode: '755'
+  when: not (rootless_enabled | bool)
+  tags:
+    - privileged
+
+- name: Custom Java Install
+  include_tasks: custom_java_install.yml
+
+- name: Add open JDK repo
+  apt_repository:
+    repo: "{{ubuntu_java_repository}}"
+  #Throttle was introduced to help mitigate the APT Lock when deploying multiple components to the same node.
+  throttle: 1
+  register: apt_add_jdk_result
+  until: apt_add_jdk_result is success
+  retries: 5
+  delay: 90
+  when:
+    - repository_configuration == 'confluent'
+    - install_java|bool
+    - not (rootless_enabled | bool)
+  tags:
+    - package
+
+- name: Install Java
+  apt:
+    name: "{{ubuntu_java_package_name}}"
+  register: java_install_result
+  until: java_install_result is success  or ansible_check_mode
+  retries: 10
+  delay: 5
+  when:
+    - install_java|bool
+    - not (rootless_enabled | bool)
+  tags: package
+
+- name: Install OpenSSL
+  apt:
+    name: openssl
+  when: not (rootless_enabled | bool)
+  tags: package
+
+- name: Get Java Version
+  command: java -version
+  register: version_output
+  check_mode: false
+  changed_when: false
+
+- name: Print Java Version
+  debug:
+    msg: "Current Java Version is: {{version_output.stderr_lines[0]}}"
+
+- name: Install pip
+  apt:
+    name:
+      - python3-pip
+    state: present
+  become: true
+  tags:
+    - package
+    - pip-package
+  when: not (rootless_enabled | bool)
+
+- name: Upgrade pip
+  ansible.builtin.pip:
+    name: pip
+    extra_args: --upgrade
+  tags:
+    - package
+    - pip-package
+  when:
+    - ansible_distribution_major_version not in ['24']
+    - not (rootless_enabled | bool)
+
+- name: Install pip packages
+  ansible.builtin.pip:
+    name: "{{pip_packages}}"
+  tags:
+    - package
+    - pip-package
+  when:
+    - ansible_distribution_major_version not in ['24']
+    - not (rootless_enabled | bool)
+
+- name: Install pip packages using apt
+  apt:
+    name:
+      - "python3-{{item}}"
+    state: present
+  become: true
+  loop: "{{pip_packages}}"
+  tags: package
+  when:
+    - ansible_distribution_major_version == "24"
+    - not (rootless_enabled | bool)
+
+- name: Install pyyaml package using apt
+  apt:
+    name:
+      - "python3-yaml"
+    state: present
+  become: true
+  tags: package
+  when: not (rootless_enabled | bool)

@@ -1,0 +1,120 @@
+---
+# Cannot use Block/Rescue in Ansible Handlers: https://github.com/ansible/ansible/issues/14270
+# Implementing try/catch logic with ignore_errors and conditionals
+- name: Get Authorization Token for ksqlDB User
+  import_role:
+    name: common
+    tasks_from: get_authorization_token.yml
+  vars:
+    oauth: "{{ ksql_oauth_enabled }}"
+    oauth_user: "{{ ksql_oauth_user }}"
+    oauth_password: "{{ ksql_oauth_password }}"
+    ldap_user: "{{ ksql_ldap_user }}"
+    ldap_password: "{{ ksql_ldap_password }}"
+    mtls_client_cert: "{{ ksql_cert_path }}"
+    mtls_client_key: "{{ ksql_key_path }}"
+    cert_auth_only_enabled: "{{ ksql_mds_cert_auth_only|bool }}"
+    oauth_client_assertion_enabled: "{{ ksql_oauth_client_assertion_enabled }}"
+    oauth_client_assertion_issuer: "{{ ksql_oauth_client_assertion_issuer }}"
+    oauth_client_assertion_sub: "{{ ksql_oauth_client_assertion_sub }}"
+    oauth_client_assertion_audience: "{{ ksql_oauth_client_assertion_audience }}"
+    oauth_client_assertion_private_key_file: "{{ ksql_oauth_client_assertion_private_key_file_dest_path }}"
+    oauth_client_assertion_private_key_passphrase: "{{ ksql_oauth_client_assertion_private_key_passphrase }}"
+    oauth_client_assertion_file: "{{ ksql_third_party_oauth_client_assertion_config.ksql }}"
+    oauth_client_assertion_template_file: "{{ ksql_oauth_client_assertion_template_file_dest_path }}"
+  when: rbac_enabled or ksql_oauth_enabled
+
+- name: Wait for API to return 200
+  uri:
+    url: "{{ksql_http_protocol}}://{{ hostvars[inventory_hostname]|confluent.platform.resolve_and_format_hostname }}:{{ksql_listener_port}}/info"
+    status_code: 200
+    validate_certs: false
+    # Basic auth header is redundant for non rbac install
+    url_username: "{{ksql_health_check_user}}"
+    url_password: "{{ksql_health_check_password}}"
+    force_basic_auth: true
+  register: result1
+  until: result1.status == 200
+  retries: "{{ ksql_health_check_retries }}"
+  delay: "{{ ksql_health_check_retry_delay }}"
+  when:
+    - ksql_authentication_type != 'mtls'
+    - not ( rbac_enabled or ksql_oauth_enabled)
+  ignore_errors: true
+
+- name: Wait for API to return 200
+  uri:
+    url: "{{ksql_http_protocol}}://{{ hostvars[inventory_hostname]|confluent.platform.resolve_and_format_hostname }}:{{ksql_listener_port}}/info"
+    status_code: 200
+    validate_certs: false
+    headers:
+      Authorization: "Bearer {{ authorization_token }}"
+  register: result1_oauth
+  until: result1_oauth.status == 200
+  retries: "{{ ksql_health_check_retries }}"
+  delay: "{{ ksql_health_check_retry_delay }}"
+  when:
+    - ksql_authentication_type != 'mtls'
+    - rbac_enabled or ksql_oauth_enabled
+  no_log: "{{mask_secrets|bool}}"
+  ignore_errors: true
+
+- set_fact:
+    certs_chain: "{{ssl_file_dir_final}}/ksql.chain"
+
+- name: Wait for API to return 200 - mTLS
+  uri:
+    url: "{{ksql_http_protocol}}://{{ hostvars[inventory_hostname]|confluent.platform.resolve_and_format_hostname }}:{{ksql_listener_port}}/info"
+    status_code: 200
+    validate_certs: false
+    client_cert: "{{ ksql_cert_path if ssl_provided_keystore_and_truststore else certs_chain }}"
+    client_key: "{{ksql_key_path}}"
+    # Basic auth header is redundant for non rbac install
+    url_username: "{{ksql_health_check_user}}"
+    url_password: "{{ksql_health_check_password}}"
+    force_basic_auth: true
+  register: result2
+  until: result2.status == 200
+  retries: "{{ ksql_health_check_retries }}"
+  delay: "{{ ksql_health_check_retry_delay }}"
+  when:
+    - ksql_authentication_type == 'mtls'
+    - not (rbac_enabled or ksql_oauth_enabled)
+  ignore_errors: true
+
+- name: Wait for API to return 200 - mTLS
+  uri:
+    url: "{{ksql_http_protocol}}://{{ hostvars[inventory_hostname]|confluent.platform.resolve_and_format_hostname }}:{{ksql_listener_port}}/info"
+    status_code: 200
+    validate_certs: false
+    client_cert: "{{ ksql_cert_path if ssl_provided_keystore_and_truststore else certs_chain }}"
+    client_key: "{{ksql_key_path}}"
+    headers:
+      Authorization: "Bearer {{ authorization_token }}"
+  register: result2_oauth
+  until: result2_oauth.status == 200
+  retries: "{{ ksql_health_check_retries }}"
+  delay: "{{ ksql_health_check_retry_delay }}"
+  no_log: "{{mask_secrets|bool}}"
+  when:
+    - ksql_authentication_type == 'mtls'
+    - rbac_enabled or ksql_oauth_enabled
+  ignore_errors: true
+
+- name: Fetch Log Files and Error out
+  block:
+    - name: Fetch Files for Debugging Failure
+      # Cannot use include_role in Ansible Handlers: https://github.com/ansible/ansible/issues/20493
+      include_tasks: ../../common/tasks/fetch_logs.yml
+      vars:
+        service_name: "{{ksql_service_name}}"
+        config_file: "{{ksql.config_file}}"
+        log_dir: "{{ksql_service_environment_overrides.LOG_DIR}}"
+        user: "{{ksql_user}}"
+        group: "{{ksql_group}}"
+
+    - name: Fail Provisioning
+      fail:
+        msg: Health checks failed. Review exported files.
+  # When only one health check runs, only one will have a 'failed' field. For skipped checks, defaulting 'failed' to False
+  when: result1.failed|default(False) or result2.failed|default(False)

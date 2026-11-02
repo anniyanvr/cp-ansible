@@ -1,0 +1,19 @@
+---
+namespace: confluent
+name: platform
+version: 8.4.0
+readme: README.md
+authors:
+  - Confluent Ansible Community
+description: Confluent Platform Ansible Collection (https://github.com/confluentinc/cp-ansible)
+license_file: LICENSE.md
+tags:
+  - confluent
+  - kafka
+  - application
+dependencies:
+  ansible.posix: "*"
+repository: https://github.com/confluentinc/cp-ansible
+documentation: https://docs.confluent.io/ansible/current/overview.html
+homepage: https://github.com/confluentinc/cp-ansible
+issues: https://github.com/confluentinc/cp-ansible/issues
